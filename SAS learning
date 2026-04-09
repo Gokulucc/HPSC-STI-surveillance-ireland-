@@ -1,0 +1,367 @@
+   STI Surveillance Pipeline — HPSC Ireland 2017–2024
+   Author  : GokulRaj Venkatesan
+   MPH (UCC, 2026) | GBD Collaborator, IHME
+   GitHub  : github.com/gokulraj
+   Created : April 2026
+ Purpose : End-to-end SAS pipeline for STI trend analysis using
+             HPSC CIDR surveillance data (Ireland, 2017–2024).
+             Outputs calibration parameters for SITR System Dynamics
+             model built in Vensim.
+Baseline  : 2017 (year_c = year - 2017)
+   Key notes :
+      2022 flagged as structural break: HSE Free Home STI Testing
+       went nationwide October 2022, inflating chlamydia and
+       gonorrhoea notifications.
+      2020-2021 flagged as COVID-19 disruption period.
+   Data source:
+     HSE-Health Protection Surveillance Centre. STI Data Tables
+     2017-2024. Dublin: HPSC; 2025.
+    
+   STEP 1 — IMPORT RAW DATA
+   ═══════════════════════════════════════════════════════════════════ */
+
+PROC IMPORT
+    DATAFILE = "/home/gokulraj/hpsc_sti_2017_2024_complete.csv"
+    OUT      = work.import
+    DBMS     = CSV
+    REPLACE;
+    GETNAMES     = YES;
+    GUESSINGROWS = 60;
+RUN;
+
+PROC CONTENTS DATA=work.import ORDER=VARNUM; RUN;
+
+PROC PRINT DATA=work.import (OBS=10);
+    VAR year disease total_cases male female age_15_19 age_20_24;
+RUN;
+
+PROC FREQ DATA=work.import;
+    TABLES disease year / NOCUM NOPERCENT;
+RUN;
+
+
+   STEP 2 — DATA CLEANING AND FEATURE ENGINEERING
+   ═══════════════════════════════════════════════════════════════════ */
+
+DATA sti_clean;
+    SET work.import;
+
+    IF disease NOT IN (
+        'Chlamydia',
+        'Gonorrhoea',
+        'Herpes_simplex_genital',
+        'Syphilis_EIS'
+    ) THEN DELETE;
+
+    IF total_cases = . THEN DELETE;
+
+    /* Centred time covariate — intercept = 2017 baseline */
+    year_c = year - 2017;
+
+    /* 2022 structural break: HSE Home Testing went nationwide */
+    IF year = 2022 THEN home_test_flag = 1;
+    ELSE home_test_flag = 0;
+
+    /* COVID-19 disruption years */
+    IF year IN (2020, 2021) THEN covid_flag = 1;
+    ELSE covid_flag = 0;
+
+    /* Readable disease label */
+    LENGTH disease_label $35;
+    IF      disease = 'Chlamydia'
+        THEN disease_label = 'Chlamydia';
+    ELSE IF disease = 'Gonorrhoea'
+        THEN disease_label = 'Gonorrhoea';
+    ELSE IF disease = 'Herpes_simplex_genital'
+        THEN disease_label = 'Herpes simplex (genital)';
+    ELSE IF disease = 'Syphilis_EIS'
+        THEN disease_label = 'Early infectious syphilis';
+    ELSE disease_label = disease;
+
+    /* Male proportion where sex data available */
+    IF total_cases > 0 AND male NE . THEN
+        pct_male = (male / total_cases) * 100;
+
+    /* Young people (15-24) proportion */
+    IF total_cases > 0 AND age_15_19 NE . AND age_20_24 NE . THEN
+        pct_young = ((age_15_19 + age_20_24) / total_cases) * 100;
+
+    LABEL
+        year_c         = "Years since 2017 baseline"
+        home_test_flag = "Home STI testing structural break (1=2022)"
+        covid_flag     = "COVID-19 disruption period (1=2020-2021)"
+        disease_label  = "STI (readable label)"
+        pct_male       = "Percentage of cases: male"
+        pct_young      = "Percentage of cases: aged 15-24 years"
+        total_cases    = "Total notified cases";
+RUN;
+
+/* Verify: should be 32 observations, 21 variables */
+PROC PRINT DATA=sti_clean (OBS=5);
+    VAR year disease disease_label year_c covid_flag
+        home_test_flag pct_male;
+RUN;
+
+
+   STEP 3 — DESCRIPTIVE STATISTICS AND TREND TABLES
+   ═══════════════════════════════════════════════════════════════════ */
+
+PROC SORT DATA=sti_clean OUT=sti_sorted;
+    BY disease year;
+RUN;
+
+DATA sti_yoy;
+    SET sti_sorted;
+    BY disease;
+    prev_cases = LAG(total_cases);
+    IF FIRST.disease THEN prev_cases = .;
+    IF prev_cases NE . AND prev_cases > 0 THEN
+        pct_change_yoy = ((total_cases - prev_cases) / prev_cases) * 100;
+    LABEL
+        prev_cases     = "Cases in prior year"
+        pct_change_yoy = "Year-on-year % change";
+RUN;
+
+DATA sti_baseline;
+    SET sti_yoy;
+    WHERE year = 2017;
+    baseline_cases = total_cases;
+    KEEP disease baseline_cases;
+RUN;
+
+PROC SQL;
+    CREATE TABLE sti_vs_baseline AS
+    SELECT  a.*,
+            b.baseline_cases,
+            ((a.total_cases - b.baseline_cases) / b.baseline_cases) * 100
+                AS pct_change_vs_2017
+                LABEL  = "% change from 2017 baseline"
+                FORMAT = 6.1
+    FROM    sti_yoy AS a
+    LEFT JOIN sti_baseline AS b
+        ON  a.disease = b.disease
+    ORDER BY a.disease, a.year;
+QUIT;
+
+PROC PRINT DATA=sti_vs_baseline NOOBS LABEL;
+    VAR year disease_label total_cases baseline_cases
+        pct_change_yoy pct_change_vs_2017
+        covid_flag home_test_flag;
+    FORMAT total_cases baseline_cases COMMA8.
+           pct_change_yoy pct_change_vs_2017 6.1;
+    TITLE "Step 3: STI Notifications vs 2017 Baseline";
+RUN;
+
+
+   STEP 4 — SEX AND AGE STRATIFICATION
+   Complete-data years only: 2017, 2018, 2023, 2024
+   ═══════════════════════════════════════════════════════════════════ */
+
+DATA sti_stratified;
+    SET sti_clean;
+    WHERE male NE . AND female NE .;
+RUN;
+
+PROC MEANS DATA=sti_stratified N MEAN MAXDEC=1;
+    CLASS disease_label year;
+    VAR pct_male;
+    TITLE "Step 4: Male proportion (%) by disease and year";
+RUN;
+
+DATA sti_age_compare;
+    SET sti_stratified;
+    WHERE year IN (2017, 2024) AND age_15_19 NE .;
+RUN;
+
+PROC SORT DATA=sti_age_compare;
+    BY year disease_label;
+RUN;
+
+PROC TRANSPOSE DATA=sti_age_compare
+    OUT=sti_age_long (RENAME=(COL1=n_cases))
+    NAME=age_group;
+    BY year disease_label;
+    VAR age_15_19 age_20_24 age_25_29 age_30_34
+        age_35_39 age_40_44 age_45_49 age_50plus;
+RUN;
+
+DATA sti_age_long;
+    SET sti_age_long;
+    age_group = TRANWRD(age_group, 'age_', '');
+    age_group = TRANWRD(age_group, '_', '-');
+    age_group = TRANWRD(age_group, '50plus', '50+');
+RUN;
+
+PROC PRINT DATA=sti_age_long NOOBS LABEL;
+    VAR year disease_label age_group n_cases;
+    FORMAT n_cases COMMA8.;
+    TITLE "Step 4: Age distribution — 2017 (baseline) vs 2024";
+RUN;
+
+
+   STEP 5 — DISEASE-SPECIFIC TREND MODELS (PROC GLMSELECT)
+   Separate stepwise model per STI avoids scale distortion.
+   Flags: covid_flag (2020-2021), home_test_flag (2022).
+   Output: predicted values for SD model calibration.
+   ═══════════════════════════════════════════════════════════════════ */
+
+PROC GLMSELECT DATA=work.sti_clean SEED=2017;
+    WHERE disease = 'Chlamydia';
+    MODEL total_cases =
+        year_c covid_flag home_test_flag
+        year_c * covid_flag year_c * home_test_flag
+        / SELECTION=STEPWISE SLENTRY=0.05 SLSTAY=0.05;
+    OUTPUT OUT=out_chlamydia PREDICTED=pred_cases RESIDUAL=resid_cases;
+    TITLE "Step 5: GLMSELECT — Chlamydia";
+RUN;
+
+PROC GLMSELECT DATA=work.sti_clean SEED=2017;
+    WHERE disease = 'Gonorrhoea';
+    MODEL total_cases =
+        year_c covid_flag home_test_flag
+        year_c * covid_flag year_c * home_test_flag
+        / SELECTION=STEPWISE SLENTRY=0.05 SLSTAY=0.05;
+    OUTPUT OUT=out_gonorrhoea PREDICTED=pred_cases RESIDUAL=resid_cases;
+    TITLE "Step 5: GLMSELECT — Gonorrhoea";
+RUN;
+
+PROC GLMSELECT DATA=work.sti_clean SEED=2017;
+    WHERE disease = 'Herpes_simplex_genital';
+    MODEL total_cases =
+        year_c covid_flag home_test_flag
+        year_c * covid_flag year_c * home_test_flag
+        / SELECTION=STEPWISE SLENTRY=0.05 SLSTAY=0.05;
+    OUTPUT OUT=out_herpes PREDICTED=pred_cases RESIDUAL=resid_cases;
+    TITLE "Step 5: GLMSELECT — Herpes simplex (genital)";
+RUN;
+
+PROC GLMSELECT DATA=work.sti_clean SEED=2017;
+    WHERE disease = 'Syphilis_EIS';
+    MODEL total_cases =
+        year_c covid_flag home_test_flag
+        year_c * covid_flag year_c * home_test_flag
+        / SELECTION=STEPWISE SLENTRY=0.05 SLSTAY=0.05;
+    OUTPUT OUT=out_syphilis PREDICTED=pred_cases RESIDUAL=resid_cases;
+    TITLE "Step 5: GLMSELECT — Early infectious syphilis";
+RUN;
+
+DATA model_out_final;
+    SET out_chlamydia
+        out_gonorrhoea
+        out_herpes
+        out_syphilis;
+RUN;
+
+PROC PRINT DATA=model_out_final NOOBS;
+    VAR year disease_label total_cases pred_cases resid_cases
+        year_c covid_flag home_test_flag;
+    FORMAT total_cases pred_cases COMMA8.
+           resid_cases 8.1;
+    TITLE "Step 5: Disease-specific GLMSELECT — Observed vs Predicted";
+RUN;
+
+
+   STEP 6 — SD MODEL CALIBRATION PARAMETERS
+   ═══════════════════════════════════════════════════════════════════ */
+
+PROC SQL;
+    CREATE TABLE baseline_2017 AS
+    SELECT disease_label, total_cases AS baseline_n
+    FROM work.sti_clean
+    WHERE year = 2017;
+QUIT;
+
+PROC SQL;
+    CREATE TABLE sd_params AS
+    SELECT
+        a.disease_label                                   AS disease,
+        b.baseline_n
+            LABEL = "Baseline notifications 2017",
+        MAX(a.total_cases)                                AS peak_n
+            LABEL = "Peak notifications",
+        MEAN(a.total_cases)                               AS mean_n
+            LABEL = "Mean notifications 2017-2024",
+        (MAX(a.total_cases) / b.baseline_n) - 1          AS cumulative_growth
+            LABEL = "Cumulative growth vs 2017 baseline",
+        (MAX(a.total_cases) / b.baseline_n)**(1/7.0) - 1 AS cagr_7yr
+            LABEL = "CAGR 2017-2024"
+    FROM  work.sti_clean AS a
+    LEFT JOIN baseline_2017 AS b
+        ON a.disease_label = b.disease_label
+    GROUP BY a.disease_label, b.baseline_n;
+QUIT;
+
+PROC PRINT DATA=sd_params NOOBS LABEL;
+    FORMAT baseline_n peak_n mean_n COMMA8.
+           cumulative_growth cagr_7yr PERCENT6.1;
+    TITLE "Step 6: SD Model Calibration Parameters";
+    TITLE2 "CAGR 2017-2024 | Baseline: 2017 (year_c=0)";
+RUN;
+
+
+   STEP 7 — VISUALISATIONS (PROC SGPLOT)
+   ═══════════════════════════════════════════════════════════════════ */
+
+
+/* Chart 1 — Main trend line */
+PROC SGPLOT DATA=work.sti_clean;
+    SERIES X=year Y=total_cases / GROUP=disease_label
+        LINEATTRS=(THICKNESS=2)
+        MARKERS
+        MARKERATTRS=(SIZE=7);
+    REFLINE 2020 / AXIS=X
+        LINEATTRS=(COLOR=GRAY PATTERN=DASH)
+        LABEL="COVID-19"
+        LABELLOC=INSIDE;
+    REFLINE 2022 / AXIS=X
+        LINEATTRS=(COLOR=ORANGE PATTERN=DASH)
+        LABEL="Home testing"
+        LABELLOC=INSIDE;
+    XAXIS LABEL="Year" VALUES=(2017 TO 2024 BY 1);
+    YAXIS LABEL="Notifications (n)" GRID;
+    KEYLEGEND / TITLE="STI" POSITION=TOPLEFT;
+    TITLE "STI Notification Trends — Ireland 2017-2024";
+    TITLE2 "Source: HPSC CIDR | Baseline: 2017";
+RUN;
+
+/* Chart 2 — Observed vs predicted */
+PROC SGPLOT DATA=work.model_out_final;
+    SERIES X=year Y=total_cases / GROUP=disease_label
+        LINEATTRS=(THICKNESS=2 PATTERN=SOLID)
+        LEGENDLABEL="Observed";
+    SERIES X=year Y=pred_cases / GROUP=disease_label
+        LINEATTRS=(THICKNESS=1.5 PATTERN=DASH)
+        LEGENDLABEL="Predicted";
+    XAXIS LABEL="Year" VALUES=(2017 TO 2024 BY 1);
+    YAXIS LABEL="Notifications (n)";
+    KEYLEGEND / TITLE=" " POSITION=TOPLEFT;
+    TITLE "Observed vs Model-Predicted STI Notifications";
+    TITLE2 "PROC GLMSELECT — Disease-specific stepwise models | R-sq: 0.85-0.97";
+RUN;
+
+/* Chart 3 — % change from baseline */
+PROC SGPLOT DATA=work.sti_vs_baseline;
+    WHERE year > 2017;
+    VBAR year / RESPONSE=pct_change_vs_2017
+        GROUP=disease_label
+        GROUPDISPLAY=CLUSTER
+        BARWIDTH=0.7;
+    REFLINE 0 / AXIS=Y LINEATTRS=(COLOR=BLACK);
+    XAXIS LABEL="Year" VALUES=(2018 TO 2024 BY 1);
+    YAXIS LABEL="% change from 2017 baseline" GRID;
+    KEYLEGEND / TITLE="STI" POSITION=TOPLEFT;
+    TITLE "STI Notifications — % Change from 2017 Baseline";
+    TITLE2 "Source: HPSC CIDR 2017-2024 | GokulRaj Venkatesan MPH (UCC)";
+RUN;
+
+APPENDIX — SD MODEL PARAMETER MAPPING (Vensim SITR inputs still working this an draft)
+ β  transmission rate  : Gonorrhoea CAGR=17% β~0.18-0.42
+                           Syphilis   CAGR=14% β~0.15-0.35
+                           Chlamydia  CAGR= 9% β~0.10-0.18
+                           Herpes     CAGR= 2% β~0.05-0.10
+   τ  testing rate       : home_test_flag +35% detection uplift
+   σ  treatment success  : 0.85-0.95 (HSE clinical data)
+   γ  waning immunity    : 0.05-0.15 (WHO estimates)
+   μ  birth/death rate   : 0.012 (CSO Ireland 2017-2024)
+   I0 baseline stocks    : Gonorrhoea=1915  Chlamydia=7430
+                           Herpes=1573      Syphilis=450
